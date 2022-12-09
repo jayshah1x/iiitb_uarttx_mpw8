@@ -70,8 +70,16 @@ module user_proj_example #(
 );
     wire clk;
     wire rst;
+  
+    wire i_Clock;
+    wire       i_TX_DV;
+    wire [7:0] i_TX_Byte; 
+    wire      o_TX_Active;
+    wire  o_TX_Serial;
+    wire      o_TX_Done;
+    parameter c_CLKS_PER_BIT    = 217;
 
-    wire [`MPRJ_IO_PADS-1:0] io_in;
+    /*wire [`MPRJ_IO_PADS-1:0] io_in;
     wire [`MPRJ_IO_PADS-1:0] io_out;
     wire [`MPRJ_IO_PADS-1:0] io_oeb;
 
@@ -87,15 +95,19 @@ module user_proj_example #(
     assign valid = wbs_cyc_i && wbs_stb_i; 
     assign wstrb = wbs_sel_i & {4{wbs_we_i}};
     assign wbs_dat_o = rdata;
-    assign wdata = wbs_dat_i;
+    assign wdata = wbs_dat_i;*/
 
     // IO
-    assign io_out = count;
+    assign i_Clock = wb_clk_i;
+    assign i_TX_DV = io_in;
+    assign r_TX_Byte = io_in [36: 28];
+    assign io_out[37:35] = {w_TX_Active, w_TX_Serial, o_TX_Done};
+    assign 
     assign io_oeb = {(`MPRJ_IO_PADS-1){rst}};
 
     // IRQ
     assign irq = 3'b000;	// Unused
-
+/*
     // LA
     assign la_data_out = {{(127-BITS){1'b0}}, count};
     // Assuming LA probes [63:32] are for controlling the count register  
@@ -103,63 +115,170 @@ module user_proj_example #(
     // Assuming LA probes [65:64] are for controlling the count clk & reset  
     assign clk = (~la_oenb[64]) ? la_data_in[64]: wb_clk_i;
     assign rst = (~la_oenb[65]) ? la_data_in[65]: wb_rst_i;
-
-    counter #(
-        .BITS(BITS)
-    ) counter(
-        .clk(clk),
-        .reset(rst),
-        .ready(wbs_ack_o),
-        .valid(valid),
-        .rdata(rdata),
-        .wdata(wbs_dat_i),
-        .wstrb(wstrb),
-        .la_write(la_write),
-        .la_input(la_data_in[63:32]),
-        .count(count)
-    );
+*/
+    
+        
+  UART_TX #(.CLKS_PER_BIT(c_CLKS_PER_BIT)) UART_TX_Inst
+    (.i_Clock(r_Clock),
+     .i_TX_DV(r_TX_DV),
+     .i_TX_Byte(r_TX_Byte),
+     .o_TX_Active(w_TX_Active),
+     .o_TX_Serial(w_TX_Serial),
+     .o_TX_Done(o_TX_Done)
+     );
 
 endmodule
 
-module counter #(
-    parameter BITS = 32
-)(
-    input clk,
-    input reset,
-    input valid,
-    input [3:0] wstrb,
-    input [BITS-1:0] wdata,
-    input [BITS-1:0] la_write,
-    input [BITS-1:0] la_input,
-    output ready,
-    output [BITS-1:0] rdata,
-    output [BITS-1:0] count
-);
-    reg ready;
-    reg [BITS-1:0] count;
-    reg [BITS-1:0] rdata;
-
-    always @(posedge clk) begin
-        if (reset) begin
-            count <= 0;
-            ready <= 0;
-        end else begin
-            ready <= 1'b0;
-            if (~|la_write) begin
-                count <= count + 1;
+module UART_TX 
+  #(parameter CLKS_PER_BIT = 217)
+  (
+   input       i_Clock,
+   input       i_TX_DV,
+   input [7:0] i_TX_Byte, 
+   output      o_TX_Active,
+   output reg  o_TX_Serial,
+   output      o_TX_Done
+   );
+ 
+  parameter IDLE         = 3'b000;
+  parameter TX_START_BIT = 3'b001;
+  parameter TX_DATA_BITS = 3'b010;
+  parameter TX_STOP_BIT  = 3'b011;
+  parameter CLEANUP      = 3'b100;
+  
+  reg [2:0] r_SM_Main     = 0;
+  reg [7:0] r_Clock_Count = 0;
+  reg [2:0] r_Bit_Index   = 0;
+  reg [7:0] r_TX_Data     = 0;
+  reg       r_TX_Done     = 0;
+  reg       r_TX_Active   = 0;
+  reg baudrate = 0;
+  reg o_enable_tx = 0;
+  reg busy = 0;
+    
+  always @(posedge i_Clock)
+  begin
+      
+    case (r_SM_Main)
+      IDLE :
+        begin
+          o_TX_Serial   <= 1'b1;         // Drive Line High for Idle
+          r_TX_Done     <= 1'b0;
+          r_Clock_Count <= 0;
+          r_Bit_Index   <= 0;
+          
+          if (i_TX_DV == 1'b1)
+          begin
+            r_TX_Active <= 1'b1;
+            r_TX_Data   <= i_TX_Byte;
+            r_SM_Main   <= TX_START_BIT;
+          end
+          else
+            r_SM_Main <= IDLE;
+        end // case: IDLE
+      
+      
+      // Send out Start Bit. Start bit = 0
+      TX_START_BIT :
+        begin
+          busy = 1;
+          o_enable_tx = 1;
+          o_TX_Serial <= 1'b0;
+          baudrate = 1;
+          
+          // Wait CLKS_PER_BIT-1 clock cycles for start bit to finish
+          if (r_Clock_Count < CLKS_PER_BIT-1)
+          begin
+            o_enable_tx = 0;
+            r_Clock_Count <= r_Clock_Count + 1;
+            r_SM_Main     <= TX_START_BIT;
+          end
+          else
+          begin
+            baudrate = 0;
+            o_enable_tx = 0;
+            r_Clock_Count <= 0;
+            r_SM_Main     <= TX_DATA_BITS;
+          end
+        end // case: TX_START_BIT
+      
+      
+      // Wait CLKS_PER_BIT-1 clock cycles for data bits to finish         
+      TX_DATA_BITS :
+        begin
+          baudrate = 1;
+          o_TX_Serial <= r_TX_Data[r_Bit_Index];
+          
+          if (r_Clock_Count < CLKS_PER_BIT-1)
+          begin
+            
+            r_Clock_Count <= r_Clock_Count + 1;
+            r_SM_Main     <= TX_DATA_BITS;
+          end
+          else
+          begin
+            baudrate = 0;
+            r_Clock_Count <= 0;
+            
+            // Check if we have sent out all bits
+            if (r_Bit_Index < 7)
+            begin
+              r_Bit_Index <= r_Bit_Index + 1;
+              r_SM_Main   <= TX_DATA_BITS;
             end
-            if (valid && !ready) begin
-                ready <= 1'b1;
-                rdata <= count;
-                if (wstrb[0]) count[7:0]   <= wdata[7:0];
-                if (wstrb[1]) count[15:8]  <= wdata[15:8];
-                if (wstrb[2]) count[23:16] <= wdata[23:16];
-                if (wstrb[3]) count[31:24] <= wdata[31:24];
-            end else if (|la_write) begin
-                count <= la_write & la_input;
+            else
+            begin
+              r_Bit_Index <= 0;
+              r_SM_Main   <= TX_STOP_BIT;
             end
+          end 
+        end // case: TX_DATA_BITS
+      
+      
+      // Send out Stop bit.  Stop bit = 1
+      TX_STOP_BIT :
+        begin
+          baudrate = 1;
+          o_TX_Serial <= 1'b1;
+          
+          // Wait CLKS_PER_BIT-1 clock cycles for Stop bit to finish
+          if (r_Clock_Count < CLKS_PER_BIT-1)
+          begin
+            r_Clock_Count <= r_Clock_Count + 1;
+            r_SM_Main     <= TX_STOP_BIT;
+          end
+          else
+          begin
+            busy = 0;
+            baudrate = 0;
+            r_TX_Done     <= 1'b1;
+            r_Clock_Count <= 0;
+            r_SM_Main     <= CLEANUP;
+            r_TX_Active   <= 1'b0;
+          end 
+        end // case: TX_STOP_BIT
+      
+      
+      // Stay here 1 clock
+      CLEANUP :
+        begin
+          r_TX_Done <= 1'b1;
+          r_SM_Main <= IDLE;
         end
-    end
-
+      
+      
+      default :
+        r_SM_Main <= IDLE;
+      
+    endcase
+  end
+  
+  assign o_TX_Active = r_TX_Active;
+  assign o_TX_Done   = r_TX_Done;
+  
 endmodule
+
+
+
+
 `default_nettype wire
